@@ -389,9 +389,11 @@ invariants so future kinds don't regress them:
   count-only `log-u8` reply under `prefers-reduced-motion` pins normMax at
   the reply's own `max`, so decoding to floats and re-encoding against that
   same max is the identity. Those replies upload `buf` straight to R8
-  (`lodUploadWireGrid`) and keep `grid` null, retaining the wire bytes so the
-  `_homeDensity` restore (T7) can re-upload after the buffer is gone. Every
-  other reply still decodes through `_uploadGrid`.
+  (`lodUploadWireGrid`) and keep `grid` null. They retain the wire bytes as a
+  defensive rebuild source for any explicit texture re-upload; the current
+  kernel-attached reply path and kernel-less `_homeDensity` restore do not
+  naturally compose, while context recovery rebuilds from the original
+  payload. Every other reply still decodes through `_uploadGrid`.
 - **T5 — stale replies die:** seq on view updates, drill_seq on subsets,
   pending-view hold for prefetched drills.
 - **T6 — invalid requests do not mutate:** malformed viewport/screen requests

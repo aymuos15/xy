@@ -843,20 +843,39 @@ try{{
     }}
     const qwire=(qok && Math.abs(gd.density.max-qmax)<1e-9)?1:0;
     // --- Direct-wire density (reduced motion): a count-only log-u8 reply
-    // uploads the wire bytes verbatim (grid null, normMax pinned to max) and
-    // retains a copy on density.wire so re-uploads survive without a decoded
-    // grid. Then the home-extent restore in _requestSampleRebin — the path
-    // that dereferenced the null grid — must re-upload from the wire copy.
+    // uploads the wire bytes verbatim (grid null, normMax pinned to max). Spy
+    // on texImage2D so retained CPU state cannot hide a bad GPU upload. The
+    // home-extent restore is a defensive composition: kernel replies and the
+    // kernel-less re-bin path do not naturally overlap, so build it by hand
+    // and prove that its explicit re-upload uses the retained wire copy too.
     const rmPrev=v._prefersReducedMotion.bind(v);
     v._prefersReducedMotion=()=>true;
     const rmax=9, renc=new Uint8Array(64);
     for(let i=0;i<64;i++){{const c=(i%4===0)?9:(i%7===0?1:0);
       renc[i]=c>0?Math.max(1,Math.min(255,Math.round(255*Math.log1p(c)/Math.log1p(rmax)))):0;}}
+    const texImage2DPrev=v.gl.texImage2D;
+    const directUploads=[];
+    v.gl.texImage2D=function(...args){{
+      if(args[2]===this.R8 && args[3]===8 && args[4]===8 &&
+          args[6]===this.RED && args[7]===this.UNSIGNED_BYTE && args[8] instanceof Uint8Array){{
+        directUploads.push({{w:args[3],h:args[4],internal:args[2],format:args[6],
+          type:args[7],data:new Uint8Array(args[8])}});
+      }}
+      return texImage2DPrev.apply(this,args);
+    }};
+    const directUploadMatches=(upload)=>{{
+      if(!upload || upload.w!==8 || upload.h!==8 || upload.internal!==v.gl.R8 ||
+          upload.format!==v.gl.RED || upload.type!==v.gl.UNSIGNED_BYTE ||
+          upload.data.length!==renc.length) return false;
+      for(let i=0;i<renc.length;i++) if(upload.data[i]!==renc[i]) return false;
+      return true;
+    }};
     v._onKernelMsg({{type:"density_update",traces:[{{id:gd.trace.id,mode:"density",visible:12345,
       density:{{buf:0,w:8,h:8,max:rmax,enc:"log-u8",x_range:[0,100],y_range:[0,100]}}}}]}},[renc.buffer.slice(0)]);
     let dwire=(gd.density.grid===null && gd.density.wire instanceof Uint8Array &&
       gd.density.wire.length===64 && gd.density.normMax===rmax &&
-      v.gl.isTexture(gd.density.tex))?1:0;
+      v.gl.isTexture(gd.density.tex) && directUploads.length===1 &&
+      directUploadMatches(directUploads[0]))?1:0;
     if(dwire){{for(let i=0;i<64;i++) if(gd.density.wire[i]!==renc[i]) dwire=0;}}
     let drestore=0;
     try{{
@@ -867,8 +886,10 @@ try{{
       if(!v.view0) v.view0={{...v.view}};
       v._requestSampleRebin(gd, v.view0, 0);
       drestore=(zoomed && gd.density.grid===null && gd.density.wire instanceof Uint8Array &&
-        gd.density.xRange[1]===100 && v.gl.isTexture(gd.density.tex))?1:0;
+        gd.density.xRange[1]===100 && v.gl.isTexture(gd.density.tex) &&
+        directUploads.length===3 && directUploads.every(directUploadMatches))?1:0;
     }}catch(e){{ drestore=0; }}
+    v.gl.texImage2D=texImage2DPrev;
     gd._homeDensity=null;
     v._prefersReducedMotion=rmPrev;
     // --- Rapid zoom in/out torture (drill thrash): the marks/density alphas
