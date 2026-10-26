@@ -1898,7 +1898,7 @@ pub fn triangle_edges_into(
     }
     let mut seen = std::collections::HashSet::with_capacity(capacity);
     let mut written = 0;
-    for face in triangles.chunks_exact(3) {
+    for face in triangles.as_chunks::<3>().0 {
         if face
             .iter()
             .any(|index| *index < 0 || *index as usize >= x.len())
@@ -2194,7 +2194,7 @@ pub fn marching_triangles_into(
         && out_y1.is_empty()
         && out_levels.is_empty();
     let mut written = 0;
-    for face in triangles.chunks_exact(3) {
+    for face in triangles.as_chunks::<3>().0 {
         if face
             .iter()
             .any(|index| *index < 0 || *index as usize >= x.len())
@@ -2583,12 +2583,19 @@ fn m4_range(
     out
 }
 
+fn m4_bucket_end<F>(values: &[f64], bucket: usize, bucket_of: &F) -> usize
+where
+    F: Fn(f64) -> usize,
+{
+    values.partition_point(|&value| bucket_of(value) == bucket)
+}
+
 /// Buckets are monotone non-decreasing in sorted x, so every bucket's rows are
-/// contiguous. Split the window at bucket boundaries (nudging each split
-/// forward until it starts a new bucket), scan each segment with the same
-/// serial routine, and concatenate in order — bitwise identical to the serial
-/// pass for any thread count. Degenerate case: one giant bucket collapses to
-/// a single segment (serial speed, still correct).
+/// contiguous. Split the window at bucket boundaries (finding each boundary
+/// with a binary search), scan each segment with the same serial routine, and
+/// concatenate in order — bitwise identical to the serial pass for any thread
+/// count. Degenerate case: one giant bucket collapses to a single segment
+/// without repeatedly scanning that bucket.
 #[allow(clippy::too_many_arguments)]
 fn m4_indices_impl(
     x: &[f64],
@@ -2604,14 +2611,17 @@ fn m4_indices_impl(
     if threads <= 1 {
         return m4_range(x, y, x0, inv_bucket_w, n_buckets, start, end);
     }
-    let bucket_of = |i: usize| (((x[i] - x0) * inv_bucket_w) as usize).min(n_buckets - 1);
+    let bucket_of = |value: f64| {
+        (((value - x0) * inv_bucket_w) as usize).min(n_buckets - 1)
+    };
     let span = end - start;
     let chunk = span.div_ceil(threads);
     let mut bounds: Vec<usize> = vec![start];
     for t in 1..threads {
         let mut j = (start + t * chunk).min(end);
-        while j < end && j > 0 && bucket_of(j) == bucket_of(j - 1) {
-            j += 1;
+        if j < end {
+            let bucket = bucket_of(x[j - 1]);
+            j += m4_bucket_end(&x[j..end], bucket, &bucket_of);
         }
         let prev = *bounds.last().expect("bounds never empty");
         if j > prev && j < end {
@@ -3636,7 +3646,7 @@ pub fn bin_2d_mean_color(
         BinColorSource::Rgba(rgba) => assert_eq!(rgba.len(), x.len() * 4),
     }
     let grid = bin_2d_mean_color_cells(x, y, colors, x0, x1, y0, y1, w, h);
-    for (cell, quad) in grid.iter().zip(out.chunks_exact_mut(4)) {
+    for (cell, quad) in grid.iter().zip(out.as_chunks_mut::<4>().0.iter_mut()) {
         quad.copy_from_slice(&cell.rgba8());
     }
 }
@@ -6796,6 +6806,34 @@ mod tests {
         assert!(!idx.contains(&1)); // NaN y
         assert!(!idx.contains(&3)); // inf y
         assert!(idx.contains(&2));
+    }
+
+    #[test]
+    fn m4_clustered_split_search_is_logarithmic() {
+        use std::cell::Cell;
+
+        let x: Vec<f64> = (0..200_000)
+            .map(|i| if i < 194_000 { 0.5 } else { 1.5 })
+            .collect();
+        let y: Vec<f64> = (0..x.len()).map(|i| (i as f64 * 0.01).sin()).collect();
+        let serial = m4_indices_impl(&x, &y, 0.0, 2.0, 1_000, 0, x.len(), 1);
+        let dispatched = m4_indices_impl(&x, &y, 0.0, 2.0, 1_000, 0, x.len(), 18);
+        assert_eq!(serial, dispatched);
+
+        let probes = Cell::new(0usize);
+        let bucket_of = |value: f64| {
+            probes.set(probes.get() + 1);
+            value as usize
+        };
+
+        let offset = m4_bucket_end(&x[10_000..], 0, &bucket_of);
+
+        assert_eq!(offset, 184_000);
+        assert!(
+            probes.get() <= 20,
+            "dominant-bucket split used {} probes",
+            probes.get()
+        );
     }
 
     #[test]
